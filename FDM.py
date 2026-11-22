@@ -152,10 +152,8 @@ class Worker(QThread):
     error_sig = Signal(int, str)
     finished_sig = Signal(int, bool)
 
-    SEGMENTS = 32
     CHUNK = 128 * 1024
     MAX_RETRIES = 5
-    RETRY_DELAY = 1.0
 
     def __init__(self, row, url, filepath, existing_size=0):
         super().__init__()
@@ -166,12 +164,8 @@ class Worker(QThread):
         self._pause = threading.Event()
         self._pause.set()
         self._stop = False
-        self._lock = threading.Lock()
         self._downloaded = 0
         self._total = 0
-        self._threads = []
-        self._segment_errors = []
-        self._segment_done = 0
 
     def pause(self):
         self._pause.clear()
@@ -179,236 +173,149 @@ class Worker(QThread):
 
     def resume(self):
         self._pause.set()
-        self.status_sig.emit(self.row, "downloading")
+        if self.isRunning():
+            self.status_sig.emit(self.row, "downloading")
 
     def cancel(self):
         self._stop = True
         self._pause.set()
 
     def _wait_if_paused(self):
-        while not self._stop and not self._pause.wait(0.25):
+        while not self._stop and not self._pause.wait(0.2):
             pass
         return not self._stop
 
-    def _probe_ranges(self):
-        """Confirm byte-range support with an actual GET, not only HEAD headers."""
+    def _get_total_size(self):
         try:
-            with requests.get(
-                self.url,
-                headers={"Range": "bytes=0-0"},
-                stream=True,
-                allow_redirects=True,
-                timeout=(15, 20),
-            ) as response:
-                if response.status_code != 206:
-                    return False
-                content_range = response.headers.get("Content-Range", "")
-                return content_range.startswith("bytes 0-0/")
+            response = requests.head(self.url, allow_redirects=True, timeout=(10, 15))
+            response.raise_for_status()
+            value = response.headers.get("Content-Length")
+            return int(value) if value else 0
         except requests.RequestException:
-            return False
+            return 0
 
     def run(self):
-        try:
-            head = requests.head(
-                self.url, allow_redirects=True, timeout=(15, 20)
-            )
-            head.raise_for_status()
-            self._total = int(head.headers.get("Content-Length", 0) or 0)
-
-            if self._total <= 0:
-                self.error_sig.emit(self.row, "Server did not return a valid file size.")
-                self.status_sig.emit(self.row, "error")
-                self.finished_sig.emit(self.row, False)
-                return
-
-            # Probe actual GET Range behavior. The previous implementation trusted
-            # the file's existing size, which is unsafe because segmented downloads
-            # preallocate the whole file before every byte has arrived.
-            ranges_supported = self._probe_ranges()
-
-            if not ranges_supported:
-                # The server cannot safely split the file; use one ordinary connection.
-                self.status_sig.emit(self.row, "downloading")
-                self._download_single()
-            else:
-                # For segmented mode, start clean so all byte ranges have known ownership.
-                self.existing_size = 0
-                with open(self.filepath, "wb") as file_obj:
-                    file_obj.truncate(self._total)
-                self.status_sig.emit(self.row, "downloading")
-                self._spawn_segments()
-                self._monitor_threads()
-
-            if self._stop:
-                self.status_sig.emit(self.row, "paused")
-                self.finished_sig.emit(self.row, False)
-                return
-
-            if self._segment_errors:
-                details = "\n".join(self._segment_errors[:5])
-                self.error_sig.emit(
-                    self.row,
-                    "Some download connections failed after all retries. "
-                    "The file is incomplete and was not marked as successful.\n" + details,
-                )
-                self.status_sig.emit(self.row, "error")
-                self.finished_sig.emit(self.row, False)
-                return
-
-            if not os.path.exists(self.filepath) or os.path.getsize(self.filepath) != self._total:
-                self.error_sig.emit(self.row, "Downloaded file size does not match the server file size.")
-                self.status_sig.emit(self.row, "error")
-                self.finished_sig.emit(self.row, False)
-                return
-
-            self.progress_sig.emit(self.row, 100, 0)
-            self.status_sig.emit(self.row, "done")
-            self.finished_sig.emit(self.row, True)
-
-        except Exception as exc:
-            self.error_sig.emit(self.row, str(exc))
-            self.status_sig.emit(self.row, "error")
-            self.finished_sig.emit(self.row, False)
-
-    def _spawn_segments(self):
-        self._threads = []
-        segment_size = (self._total + self.SEGMENTS - 1) // self.SEGMENTS
-        for index in range(self.SEGMENTS):
-            start = index * segment_size
-            end = min(self._total - 1, start + segment_size - 1)
-            if start > end:
-                continue
-            thread = threading.Thread(
-                target=self._segment_with_retry,
-                args=(start, end, index),
-                daemon=True,
-            )
-            self._threads.append(thread)
-            thread.start()
-
-    def _segment_with_retry(self, start, end, index):
-        """Retry only this segment; other segment threads continue independently."""
-        position = start
+        retries = 0
         last_error = None
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.filepath)), exist_ok=True)
+            self._total = self._get_total_size()
+            current_size = os.path.getsize(self.filepath) if os.path.exists(self.filepath) else 0
 
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            if self._stop:
-                return
-            if not self._wait_if_paused():
-                return
-            try:
-                headers = {"Range": f"bytes={position}-{end}"}
-                with requests.get(
-                    self.url,
-                    headers=headers,
-                    stream=True,
-                    allow_redirects=True,
-                    timeout=(15, 30),
-                ) as response:
-                    if response.status_code != 206:
-                        raise RuntimeError(
-                            f"Expected HTTP 206 for byte range, got {response.status_code}"
-                        )
+            # Older segmented builds preallocated the entire file. Such files
+            # cannot be safely resumed because their size is not real progress.
+            if self._total and current_size >= self._total:
+                current_size = 0
+                with open(self.filepath, "wb"):
+                    pass
 
-                    content_range = response.headers.get("Content-Range", "")
-                    expected_prefix = f"bytes {position}-"
-                    if not content_range.startswith(expected_prefix):
-                        raise RuntimeError(
-                            f"Invalid Content-Range response: {content_range or 'missing'}"
-                        )
+            self._downloaded = current_size
+            if self._total > 0 and current_size > 0:
+                initial_percent = min(99, int(current_size * 100 / self._total))
+                self.progress_sig.emit(self.row, initial_percent, 0)
 
-                    with open(self.filepath, "r+b") as output:
-                        output.seek(position)
-                        for chunk in response.iter_content(chunk_size=self.CHUNK):
-                            if self._stop:
-                                return
-                            if not self._wait_if_paused():
-                                return
-                            if not chunk:
-                                continue
-                            remaining = end - position + 1
-                            if len(chunk) > remaining:
-                                chunk = chunk[:remaining]
-                            output.write(chunk)
-                            position += len(chunk)
-                            with self._lock:
-                                self._downloaded += len(chunk)
-
-                    if position != end + 1:
-                        raise IOError(
-                            f"Connection {index + 1} ended early at byte {position - 1}; "
-                            f"expected {end}"
-                        )
-
-                    with self._lock:
-                        self._segment_done += 1
+            while not self._stop:
+                if not self._wait_if_paused():
+                    self.status_sig.emit(self.row, "paused")
+                    self.finished_sig.emit(self.row, False)
                     return
 
-            except Exception as exc:
-                last_error = exc
-                if attempt < self.MAX_RETRIES and not self._stop:
-                    self.status_sig.emit(self.row, "downloading")
-                    # Wait only this worker thread; all other connections keep running.
-                    for _ in range(int(self.RETRY_DELAY * attempt * 10)):
-                        if self._stop:
-                            return
-                        self._pause.wait(0.1)
-                else:
-                    with self._lock:
-                        self._segment_errors.append(
-                            f"Connection {index + 1}: {last_error}"
-                        )
+                try:
+                    self.status_sig.emit(self.row, "downloading" if retries == 0 else "reconnecting")
+                    offset = os.path.getsize(self.filepath) if os.path.exists(self.filepath) else 0
+                    headers = {"Range": f"bytes={offset}-"} if offset > 0 else {}
 
-    def _download_single(self):
-        """Fallback for servers that do not support byte ranges."""
-        last_error = None
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            if self._stop:
-                return
-            try:
-                # Restart from zero: without Range support, safe partial continuation
-                # cannot be guaranteed.
-                self._downloaded = 0
-                with requests.get(
-                    self.url, stream=True, allow_redirects=True, timeout=(15, 30)
-                ) as response:
-                    response.raise_for_status()
-                    with open(self.filepath, "wb") as output:
-                        for chunk in response.iter_content(chunk_size=self.CHUNK):
-                            if self._stop:
-                                return
-                            if not self._wait_if_paused():
-                                return
-                            if chunk:
+                    with requests.get(
+                        self.url, headers=headers, stream=True,
+                        allow_redirects=True, timeout=(15, 20)
+                    ) as response:
+                        if offset > 0 and response.status_code == 206:
+                            content_range = response.headers.get("Content-Range", "")
+                            if not content_range.startswith(f"bytes {offset}-"):
+                                raise IOError("Invalid Content-Range response from server.")
+                            mode = "ab"
+                        elif offset > 0 and response.status_code == 200:
+                            # Server ignored Range; restart instead of corrupting the file.
+                            offset = 0
+                            mode = "wb"
+                        elif response.status_code == 206:
+                            mode = "wb"
+                        else:
+                            response.raise_for_status()
+                            mode = "wb"
+
+                        response_length = response.headers.get("Content-Length")
+                        if self._total <= 0 and response_length:
+                            length = int(response_length)
+                            content_range = response.headers.get("Content-Range", "")
+                            if response.status_code == 206 and "/" in content_range:
+                                try:
+                                    self._total = int(content_range.rsplit("/", 1)[1])
+                                except ValueError:
+                                    self._total = offset + length
+                            else:
+                                self._total = offset + length if offset else length
+
+                        with open(self.filepath, mode) as output:
+                            for chunk in response.iter_content(chunk_size=self.CHUNK):
+                                if self._stop:
+                                    break
+                                if not self._wait_if_paused():
+                                    break
+                                if not chunk:
+                                    continue
                                 output.write(chunk)
-                                self._downloaded += len(chunk)
-                if os.path.getsize(self.filepath) != self._total:
-                    raise IOError("Downloaded file size does not match expected size.")
-                return
-            except Exception as exc:
-                last_error = exc
-                if attempt < self.MAX_RETRIES:
-                    time.sleep(self.RETRY_DELAY * attempt)
-        self._segment_errors.append(f"Single connection: {last_error}")
+                                output.flush()
+                                self._downloaded = output.tell()
+                                percent = min(99, int(self._downloaded * 100 / self._total)) if self._total else 0
+                                self.progress_sig.emit(self.row, percent, 0)
 
-    def _monitor_threads(self):
-        last_bytes = 0
-        last_time = time.time()
-        while any(thread.is_alive() for thread in self._threads):
-            if self._stop:
-                break
-            time.sleep(0.3)
-            with self._lock:
-                downloaded = self._downloaded
-            now = time.time()
-            speed = int((downloaded - last_bytes) / max(now - last_time, 0.001))
-            last_bytes = downloaded
-            last_time = now
-            percent = int((downloaded / self._total) * 100) if self._total else 0
-            self.progress_sig.emit(self.row, min(percent, 99), speed)
+                    if self._stop or not self._pause.is_set():
+                        self.status_sig.emit(self.row, "paused")
+                        self.finished_sig.emit(self.row, False)
+                        return
 
-        for thread in self._threads:
-            thread.join()
+                    actual_size = os.path.getsize(self.filepath)
+                    if self._total > 0 and actual_size < self._total:
+                        raise IOError(f"Connection ended early ({actual_size} of {self._total} bytes).")
+                    if self._total > 0 and actual_size > self._total:
+                        raise IOError("Downloaded file is larger than expected.")
+
+                    self.progress_sig.emit(self.row, 100, 0)
+                    self.status_sig.emit(self.row, "done")
+                    self.finished_sig.emit(self.row, True)
+                    return
+
+                except Exception as exc:
+                    last_error = str(exc)
+
+                if self._stop:
+                    self.status_sig.emit(self.row, "paused")
+                    self.finished_sig.emit(self.row, False)
+                    return
+
+                retries += 1
+                if retries >= self.MAX_RETRIES:
+                    self.status_sig.emit(self.row, "paused")
+                    self.error_sig.emit(
+                        self.row,
+                        "اتصال اینترنت قطع شد یا سرور پاسخ نداد.\n"
+                        "داده‌های دانلودشده حفظ شده‌اند. پس از اتصال اینترنت، Resume را بزنید.\n\n"
+                        f"Details: {last_error}"
+                    )
+                    self.finished_sig.emit(self.row, False)
+                    return
+
+                self.status_sig.emit(self.row, "reconnecting")
+                for _ in range(20 * retries):
+                    if self._stop or not self._pause.wait(0.1):
+                        break
+
+        except Exception as exc:
+            self.status_sig.emit(self.row, "paused")
+            self.error_sig.emit(self.row, str(exc))
+            self.finished_sig.emit(self.row, False)
+
 
 # ============================================================
 # HELPERS & SAVE/LOAD/EXPORT/IMPORT
@@ -584,23 +491,31 @@ def set_card_status(row, st):
     card = S["cards"].get(row)
     if not card: return
     t = THEMES[S["theme"]]
-    colors = {"downloading": t["success"], "paused": t["warning"], "done": t["accent"], "error": t["danger"], "starting": t["text_dim"]}
-    labels = {"downloading": "در حال دانلود", "paused": "متوقف", "done": "کامل شد", "error": "خطا", "starting": "در انتظار"}
-    
+    colors = {
+        "downloading": t["success"], "reconnecting": t["warning"],
+        "paused": t["warning"], "done": t["accent"],
+        "error": t["danger"], "starting": t["text_dim"]
+    }
+    labels = {
+        "downloading": "در حال دانلود", "reconnecting": "اتصال مجدد...",
+        "paused": "متوقف / آماده ادامه", "done": "کامل شد",
+        "error": "خطا - قابل ادامه", "starting": "در انتظار"
+    }
     card["status_lbl"].setText(labels.get(st, st))
-    card["status_lbl"].setStyleSheet(f"font-size: 12px; font-weight: 700; color: {colors.get(st, t['text_dim'])};")
-
-    if st == "downloading":
+    card["status_lbl"].setStyleSheet(
+        f"font-size: 12px; font-weight: 700; color: {colors.get(st, t['text_dim'])};"
+    )
+    if st in ("downloading", "reconnecting"):
         card["btn_pause"].setVisible(True)
         card["btn_resume"].setVisible(False)
-    elif st == "paused":
+    elif st in ("paused", "error"):
         card["btn_pause"].setVisible(False)
         card["btn_resume"].setVisible(True)
     else:
         card["btn_pause"].setVisible(False)
         card["btn_resume"].setVisible(False)
-    
     save_state()
+
 
 # ============================================================
 # ROW ACTIONS & SIGNALS
@@ -610,19 +525,27 @@ def pause_row(row):
 
 def resume_row(row):
     if row in S["downloads"]:
-        w = S["downloads"][row]["worker"]
-        if w.isRunning():
-            w.resume()
+        info = S["downloads"][row]
+        worker = info["worker"]
+        if worker.isRunning():
+            worker.resume()
         else:
-            w.start()
+            # A finished QThread should not be reused; create a fresh worker
+            # while keeping the existing partial file on disk.
+            new_worker = Worker(row, info["url"], info["path"])
+            new_worker.progress_sig.connect(on_progress)
+            new_worker.status_sig.connect(on_status)
+            new_worker.error_sig.connect(on_error)
+            new_worker.finished_sig.connect(on_finished)
+            info["worker"] = new_worker
+            worker.deleteLater()
+            new_worker.start()
+
 
 def resume_all():
     for row in list(S["downloads"].keys()):
-        w = S["downloads"][row]["worker"]
-        if not w.isRunning():
-            w.start()
-        else:
-            w.resume()
+        resume_row(row)
+
 
 def remove_row(row):
     if row in S["downloads"]:
@@ -642,11 +565,16 @@ def on_progress(row, pct, speed):
     card["speed_lbl"].setText(human_speed(speed) if speed else "—")
 
 def on_status(row, st):
+    if row in S["downloads"]:
+        S["downloads"][row]["status"] = st
     set_card_status(row, st)
-    if row in S["downloads"]: S["downloads"][row]["status"] = st
 
 def on_error(row, msg):
-    QMessageBox.warning(S["window"], "Download error", msg)
+    card = S["cards"].get(row)
+    if card:
+        card["speed_lbl"].setText("اتصال قطع شد؛ برای ادامه Resume را بزنید")
+        card["speed_lbl"].setToolTip(msg)
+    print(f"Download {row} paused: {msg}")
 
 def on_finished(row, ok):
     if ok and row in S["downloads"]:
